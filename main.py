@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime
 from uuid import uuid4
+import random
 
 from database import db, create_document, get_documents
 
@@ -41,62 +42,135 @@ class RateRequest(BaseModel):
     scores: List[ScoreInput]
 
 # -----------------------------
+# Mock/In-Memory Storage Fallback
+# -----------------------------
+
+MOCK_MODE = os.getenv("MOCK_MODE", "0") == "1" or db is None
+
+MEM: Dict[str, Any] = {
+    "candidates": [],
+    "criteria": [],
+    "votes": [],
+    "users": [],
+}
+
+# -----------------------------
 # Helpers & Bootstrapping
 # -----------------------------
 
-def ensure_seed_data() -> None:
-    """Ensure default candidates and criteria exist in DB"""
-    # Criteria
-    criteria_count = db["criterion"].count_documents({}) if db else 0
-    if criteria_count == 0:
-        defaults = [
-            {"id": "coding", "name": "Coding Skill", "weight": 0.4, "type": "Benefit"},
-            {"id": "comm", "name": "Communication", "weight": 0.3, "type": "Benefit"},
-            {"id": "exp", "name": "Experience", "weight": 0.3, "type": "Benefit"},
-        ]
-        for c in defaults:
-            create_document("criterion", c)
+DEFAULT_CANDIDATES = [
+    {
+        "id": "cand-1",
+        "name": "Alice Engineer",
+        "position": "Software Engineer",
+        "photo_url": "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400&auto=format&fit=crop&q=60",
+    },
+    {
+        "id": "cand-2",
+        "name": "Bob Developer",
+        "position": "Backend Developer",
+        "photo_url": "https://images.unsplash.com/photo-1552374196-c4e7ffc6e126?w=400&auto=format&fit=crop&q=60",
+    },
+    {
+        "id": "cand-3",
+        "name": "Carla Coder",
+        "position": "Frontend Engineer",
+        "photo_url": "https://images.unsplash.com/photo-1607746882042-944635dfe10e?w=400&auto=format&fit=crop&q=60",
+    },
+    {
+        "id": "cand-4",
+        "name": "Diego Architect",
+        "position": "Full‑stack Engineer",
+        "photo_url": "https://images.unsplash.com/photo-1547425260-76bcadfb4f2c?w=400&auto=format&fit=crop&q=60",
+    },
+    {
+        "id": "cand-5",
+        "name": "Eva Programmer",
+        "position": "Mobile Engineer",
+        "photo_url": "https://images.unsplash.com/photo-1502685104226-ee32379fefbe?w=400&auto=format&fit=crop&q=60",
+    },
+]
 
-    # Candidates
-    candidate_count = db["candidate"].count_documents({}) if db else 0
-    if candidate_count == 0:
-        people = [
-            {
-                "id": "se-1",
-                "name": "Alex Johnson",
-                "position": "Frontend Engineer",
-                "photo_url": "https://images.unsplash.com/photo-1607746882042-944635dfe10e?w=400&auto=format&fit=crop&q=60",
-            },
-            {
-                "id": "se-2",
-                "name": "Priya Sharma",
-                "position": "Backend Engineer",
-                "photo_url": "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400&auto=format&fit=crop&q=60",
-            },
-            {
-                "id": "se-3",
-                "name": "Diego Martinez",
-                "position": "Full‑stack Engineer",
-                "photo_url": "https://images.unsplash.com/photo-1547425260-76bcadfb4f2c?w=400&auto=format&fit=crop&q=60",
-            },
-            {
-                "id": "se-4",
-                "name": "Hana Kim",
-                "position": "Mobile Engineer",
-                "photo_url": "https://images.unsplash.com/photo-1552374196-c4e7ffc6e126?w=400&auto=format&fit=crop&q=60",
-            },
+DEFAULT_CRITERIA = [
+    {"id": "coding", "name": "Coding Skill", "weight": 0.4, "type": "Benefit"},
+    {"id": "comm", "name": "Communication", "weight": 0.3, "type": "Benefit"},
+    {"id": "exp", "name": "Experience", "weight": 0.3, "type": "Benefit"},
+]
+
+def _seed_mock_if_needed():
+    # Seed candidates and criteria
+    if not MEM["candidates"]:
+        MEM["candidates"] = [c.copy() for c in DEFAULT_CANDIDATES]
+    if not MEM["criteria"]:
+        MEM["criteria"] = [c.copy() for c in DEFAULT_CRITERIA]
+
+    # Seed demo votes from 3 decision makers so Chief dashboard shows results
+    if not MEM["votes"]:
+        dm_users = [
+            {"id": "dm-1", "role": "staff", "name": "Decision Maker 1"},
+            {"id": "dm-2", "role": "staff", "name": "Decision Maker 2"},
+            {"id": "dm-3", "role": "staff", "name": "Decision Maker 3"},
         ]
-        for p in people:
-            create_document("candidate", p)
+        MEM["users"].extend(dm_users)
+        rng = random.Random(42)
+        now = datetime.utcnow()
+        for u in dm_users:
+            for cand in MEM["candidates"]:
+                # generate deterministic but varied scores per criterion
+                scores = {}
+                for crit in MEM["criteria"]:
+                    base = 60 + rng.randint(-20, 20)
+                    # slight bias so rankings differentiate
+                    adjust = (hash(cand["id"] + crit["id"] + u["id"]) % 15) - 7
+                    val = max(1, min(100, base + adjust))
+                    scores[crit["id"]] = val
+                for crit_id, score in scores.items():
+                    MEM["votes"].append({
+                        "userId": u["id"],
+                        "candidateId": cand["id"],
+                        "criteriaId": crit_id,
+                        "scoreValue": score,
+                        "created_at": now,
+                        "updated_at": now,
+                    })
+
+
+def ensure_seed_data() -> None:
+    """Ensure default candidates and criteria exist in DB or in-memory. If DB ops fail, fallback to mock mode."""
+    global MOCK_MODE
+    if MOCK_MODE:
+        _seed_mock_if_needed()
+        return
+
+    try:
+        # Criteria
+        criteria_count = db["criterion"].count_documents({}) if db else 0
+        if criteria_count == 0:
+            for c in DEFAULT_CRITERIA:
+                create_document("criterion", c)
+
+        # Candidates
+        candidate_count = db["candidate"].count_documents({}) if db else 0
+        if candidate_count == 0:
+            for p in DEFAULT_CANDIDATES:
+                create_document("candidate", p)
+    except Exception:
+        # Any DB issue -> switch to mock immediately
+        MOCK_MODE = True
+        _seed_mock_if_needed()
 
 
 def get_all_candidates() -> List[Dict[str, Any]]:
     ensure_seed_data()
+    if MOCK_MODE:
+        return MEM["candidates"]
     return get_documents("candidate")
 
 
 def get_all_criteria() -> List[Dict[str, Any]]:
     ensure_seed_data()
+    if MOCK_MODE:
+        return MEM["criteria"]
     return get_documents("criterion")
 
 # -----------------------------
@@ -105,13 +179,14 @@ def get_all_criteria() -> List[Dict[str, Any]]:
 
 @app.get("/")
 def root():
-    return {"message": "GDSS Backend Running"}
+    return {"message": "GDSS Backend Running", "mode": "mock" if MOCK_MODE else "db"}
 
 
 @app.get("/test")
 def test_database():
     response = {
         "backend": "✅ Running",
+        "mode": "mock" if MOCK_MODE else "db",
         "database": "❌ Not Available" if db is None else "✅ Connected",
         "database_url": "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set",
         "database_name": os.getenv("DATABASE_NAME") or None,
@@ -127,9 +202,14 @@ def test_database():
 
 @app.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest):
-    name = payload.name or ("Chief Manager" if payload.role == "chief" else f"Staff #{str(uuid4())[:6]}")
+    name = payload.name or ("Chief Manager" if payload.role == "chief" else f"Decision Maker #{str(uuid4())[:6]}")
     user_id = f"{payload.role}-{str(uuid4())[:8]}"
     user_doc = {"id": user_id, "role": payload.role, "name": name}
+
+    if MOCK_MODE:
+        MEM["users"].append(user_doc)
+        return LoginResponse(**user_doc)
+
     create_document("user", user_doc)
     return LoginResponse(**user_doc)
 
@@ -147,6 +227,10 @@ def list_criteria():
 @app.get("/rated")
 def rated_candidates(userId: str = Query(...)):
     # list candidateIds already rated by this user
+    if MOCK_MODE:
+        cand_ids = list({v["candidateId"] for v in MEM["votes"] if v["userId"] == userId})
+        return {"data": cand_ids}
+
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     cand_ids = db["vote"].distinct("candidateId", {"userId": userId})
@@ -156,18 +240,35 @@ def rated_candidates(userId: str = Query(...)):
 @app.post("/rate")
 def rate_candidate(payload: RateRequest):
     """Save ratings for a candidate by a specific user. Prevent duplicate ratings per candidate per user."""
+    # Validate criteria ids exist
+    criteria = {c["id"]: c for c in get_all_criteria()}
+    for s in payload.scores:
+        if s.criteriaId not in criteria:
+            raise HTTPException(status_code=400, detail=f"Invalid criteria: {s.criteriaId}")
+
+    if MOCK_MODE:
+        # Prevent duplicate
+        has = any(v for v in MEM["votes"] if v["userId"] == payload.userId and v["candidateId"] == payload.candidateId)
+        if has:
+            raise HTTPException(status_code=400, detail="You have already rated this candidate.")
+        now = datetime.utcnow()
+        for s in payload.scores:
+            MEM["votes"].append({
+                "userId": payload.userId,
+                "candidateId": payload.candidateId,
+                "criteriaId": s.criteriaId,
+                "scoreValue": s.scoreValue,
+                "created_at": now,
+                "updated_at": now,
+            })
+        return {"status": "ok", "inserted": len(payload.scores)}
+
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
 
     existing = db["vote"].find_one({"userId": payload.userId, "candidateId": payload.candidateId})
     if existing:
         raise HTTPException(status_code=400, detail="You have already rated this candidate.")
-
-    # Validate criteria ids exist
-    criteria = {c["id"]: c for c in get_all_criteria()}
-    for s in payload.scores:
-        if s.criteriaId not in criteria:
-            raise HTTPException(status_code=400, detail=f"Invalid criteria: {s.criteriaId}")
 
     docs = []
     now = datetime.utcnow()
@@ -188,6 +289,11 @@ def rate_candidate(payload: RateRequest):
 
 @app.get("/stats")
 def stats():
+    if MOCK_MODE:
+        total_candidates = len(MEM["candidates"]) if MEM["candidates"] else 0
+        total_dms = len({v["userId"] for v in MEM["votes"]})
+        return {"totalCandidates": total_candidates, "totalDecisionMakers": total_dms}
+
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     total_candidates = db["candidate"].count_documents({})
@@ -198,12 +304,15 @@ def stats():
 @app.get("/results")
 def results():
     """Calculate Group Decision using WP (per user) + Borda aggregation"""
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
-
     candidates = get_all_candidates()
     criteria = get_all_criteria()
-    votes = list(db["vote"].find({}))
+
+    if MOCK_MODE:
+        votes = list(MEM["votes"])  # copy
+    else:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+        votes = list(db["vote"].find({}))
 
     if not candidates:
         return {"data": []}
